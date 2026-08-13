@@ -1,8 +1,16 @@
 "use client";
 
-import { createContext, useContext, useMemo } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import { generateId } from "@/lib/id";
-import { seedData } from "@/lib/seed-data";
+import { emptyLocalData } from "@/lib/seed-data";
+import { getGoalContributionsFromPaycheck } from "@/lib/finance";
+import { createClient } from "@/lib/supabase/client";
 import type {
   Account,
   AppData,
@@ -13,14 +21,17 @@ import type {
 } from "@/lib/types";
 import { useLocalStorageState } from "@/lib/use-local-storage-state";
 
-const STORAGE_KEY = "budget-planner:data:v5";
+const STORAGE_KEY = "budget-planner:local-data:v7";
+
+const ACCOUNT_COLUMNS = "id,name,type,balance";
 
 type AppDataContextValue = {
   data: AppData;
+  accountsLoading: boolean;
 
-  addAccount: (account: Omit<Account, "id">) => void;
-  updateAccount: (id: string, account: Omit<Account, "id">) => void;
-  deleteAccount: (id: string) => void;
+  addAccount: (account: Omit<Account, "id">) => Promise<void>;
+  updateAccount: (id: string, account: Omit<Account, "id">) => Promise<void>;
+  deleteAccount: (id: string) => Promise<void>;
 
   addTransaction: (transaction: Omit<Transaction, "id">) => void;
   updateTransaction: (id: string, transaction: Omit<Transaction, "id">) => void;
@@ -40,101 +51,120 @@ type AppDataContextValue = {
   addPaycheckCategory: (category: Omit<PaycheckCategory, "id">) => void;
   updatePaycheckCategory: (id: string, category: Omit<PaycheckCategory, "id">) => void;
   deletePaycheckCategory: (id: string) => void;
+  applyPaycheck: () => void;
 };
 
 const AppDataContext = createContext<AppDataContextValue | null>(null);
 
 export function AppDataProvider({ children }: { children: React.ReactNode }) {
-  const [data, setData] = useLocalStorageState<AppData>(STORAGE_KEY, seedData);
+  const supabase = useMemo(() => createClient(), []);
+
+  const [localData, setLocalData] = useLocalStorageState<Omit<AppData, "accounts">>(
+    STORAGE_KEY,
+    emptyLocalData,
+  );
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [accountsLoading, setAccountsLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    supabase
+      .from("accounts")
+      .select(ACCOUNT_COLUMNS)
+      .order("name")
+      .then(({ data: rows, error }) => {
+        if (cancelled) return;
+        if (error) {
+          console.error("Failed to load accounts", error);
+          return;
+        }
+        setAccounts(rows ?? []);
+        setAccountsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [supabase]);
+
+  const data: AppData = useMemo(
+    () => ({ ...localData, accounts }),
+    [localData, accounts],
+  );
 
   const value = useMemo<AppDataContextValue>(
     () => ({
       data,
+      accountsLoading,
 
-      addAccount: (account) =>
-        setData((prev) => ({
+      addAccount: async (account) => {
+        const { data: row, error } = await supabase
+          .from("accounts")
+          .insert(account)
+          .select(ACCOUNT_COLUMNS)
+          .single();
+        if (error) throw error;
+        setAccounts((prev) => [...prev, row]);
+      },
+      updateAccount: async (id, account) => {
+        const { data: row, error } = await supabase
+          .from("accounts")
+          .update(account)
+          .eq("id", id)
+          .select(ACCOUNT_COLUMNS)
+          .single();
+        if (error) throw error;
+        setAccounts((prev) => prev.map((a) => (a.id === id ? row : a)));
+      },
+      deleteAccount: async (id) => {
+        const { error } = await supabase.from("accounts").delete().eq("id", id);
+        if (error) throw error;
+        setAccounts((prev) => prev.filter((a) => a.id !== id));
+        setLocalData((prev) => ({
           ...prev,
-          accounts: [...prev.accounts, { ...account, id: generateId() }],
-        })),
-      updateAccount: (id, account) =>
-        setData((prev) => ({
-          ...prev,
-          accounts: prev.accounts.map((a) =>
-            a.id === id ? { ...account, id } : a,
-          ),
-        })),
-      deleteAccount: (id) =>
-        setData((prev) => ({
-          ...prev,
-          accounts: prev.accounts.filter((a) => a.id !== id),
           transactions: prev.transactions.filter((t) => t.accountId !== id),
-        })),
+        }));
+      },
 
       addTransaction: (transaction) =>
-        setData((prev) => ({
+        setLocalData((prev) => ({
           ...prev,
           transactions: [
             { ...transaction, id: generateId() },
             ...prev.transactions,
           ],
-          accounts: prev.accounts.map((a) =>
-            a.id === transaction.accountId
-              ? { ...a, balance: a.balance + transaction.amount }
-              : a,
-          ),
         })),
       updateTransaction: (id, transaction) =>
-        setData((prev) => {
-          const existing = prev.transactions.find((t) => t.id === id);
-          if (!existing) return prev;
-
-          const accounts = prev.accounts.map((a) => {
-            let balance = a.balance;
-            if (a.id === existing.accountId) balance -= existing.amount;
-            if (a.id === transaction.accountId) balance += transaction.amount;
-            return { ...a, balance };
-          });
-
-          return {
-            ...prev,
-            accounts,
-            transactions: prev.transactions.map((t) =>
-              t.id === id ? { ...transaction, id } : t,
-            ),
-          };
-        }),
+        setLocalData((prev) => ({
+          ...prev,
+          transactions: prev.transactions.map((t) =>
+            t.id === id ? { ...transaction, id } : t,
+          ),
+        })),
       deleteTransaction: (id) =>
-        setData((prev) => {
-          const existing = prev.transactions.find((t) => t.id === id);
-          if (!existing) return prev;
-          return {
-            ...prev,
-            transactions: prev.transactions.filter((t) => t.id !== id),
-            accounts: prev.accounts.map((a) =>
-              a.id === existing.accountId
-                ? { ...a, balance: a.balance - existing.amount }
-                : a,
-            ),
-          };
-        }),
+        setLocalData((prev) => ({
+          ...prev,
+          transactions: prev.transactions.filter((t) => t.id !== id),
+        })),
 
       addBill: (bill) =>
-        setData((prev) => ({
+        setLocalData((prev) => ({
           ...prev,
           bills: [...prev.bills, { ...bill, id: generateId() }],
         })),
       updateBill: (id, bill) =>
-        setData((prev) => ({
+        setLocalData((prev) => ({
           ...prev,
           bills: prev.bills.map((b) => (b.id === id ? { ...bill, id } : b)),
         })),
       deleteBill: (id) =>
-        setData((prev) => ({
+        setLocalData((prev) => ({
           ...prev,
           bills: prev.bills.filter((b) => b.id !== id),
         })),
       toggleBillPaid: (id) =>
-        setData((prev) => ({
+        setLocalData((prev) => ({
           ...prev,
           bills: prev.bills.map((b) =>
             b.id === id ? { ...b, isPaid: !b.isPaid } : b,
@@ -142,37 +172,45 @@ export function AppDataProvider({ children }: { children: React.ReactNode }) {
         })),
 
       addGoal: (goal) =>
-        setData((prev) => ({
+        setLocalData((prev) => ({
           ...prev,
           goals: [...prev.goals, { ...goal, id: generateId() }],
         })),
       updateGoal: (id, goal) =>
-        setData((prev) => ({
+        setLocalData((prev) => ({
           ...prev,
           goals: prev.goals.map((g) => (g.id === id ? { ...goal, id } : g)),
         })),
       deleteGoal: (id) =>
-        setData((prev) => ({
+        setLocalData((prev) => ({
           ...prev,
           goals: prev.goals.filter((g) => g.id !== id),
+          paycheck: {
+            ...prev.paycheck,
+            categories: prev.paycheck.categories.map((c) =>
+              c.linkedGoalId === id
+                ? { ...c, categoryType: "regular", linkedGoalId: undefined }
+                : c,
+            ),
+          },
         })),
       contributeToGoal: (id, amount) =>
-        setData((prev) => ({
+        setLocalData((prev) => ({
           ...prev,
           goals: prev.goals.map((g) =>
             g.id === id
-              ? { ...g, currentAmount: g.currentAmount + amount }
+              ? { ...g, currentAmount: Math.max(0, g.currentAmount + amount) }
               : g,
           ),
         })),
 
       updatePaycheckAmount: (amount) =>
-        setData((prev) => ({
+        setLocalData((prev) => ({
           ...prev,
           paycheck: { ...prev.paycheck, amount },
         })),
       addPaycheckCategory: (category) =>
-        setData((prev) => ({
+        setLocalData((prev) => ({
           ...prev,
           paycheck: {
             ...prev.paycheck,
@@ -183,7 +221,7 @@ export function AppDataProvider({ children }: { children: React.ReactNode }) {
           },
         })),
       updatePaycheckCategory: (id, category) =>
-        setData((prev) => ({
+        setLocalData((prev) => ({
           ...prev,
           paycheck: {
             ...prev.paycheck,
@@ -193,15 +231,29 @@ export function AppDataProvider({ children }: { children: React.ReactNode }) {
           },
         })),
       deletePaycheckCategory: (id) =>
-        setData((prev) => ({
+        setLocalData((prev) => ({
           ...prev,
           paycheck: {
             ...prev.paycheck,
             categories: prev.paycheck.categories.filter((c) => c.id !== id),
           },
         })),
+
+      applyPaycheck: () =>
+        setLocalData((prev) => {
+          const contributionsByGoalId = getGoalContributionsFromPaycheck(prev.paycheck);
+
+          return {
+            ...prev,
+            goals: prev.goals.map((g) => {
+              const contribution = contributionsByGoalId.get(g.id);
+              if (!contribution) return g;
+              return { ...g, currentAmount: Math.max(0, g.currentAmount + contribution) };
+            }),
+          };
+        }),
     }),
-    [data, setData],
+    [data, accountsLoading, supabase, setLocalData],
   );
 
   return (

@@ -59,7 +59,17 @@ export type Goal = {
   name: string;
   targetAmount: number;
   currentAmount: number;
-  targetDate: string; // ISO date
+  targetDate: string; // ISO date, optional (empty string when unset)
+  /** Account where this goal's funded amount is held. */
+  linkedAccountId: string;
+};
+
+export type PaycheckCategoryType = "regular" | "spending_budget" | "goal";
+
+export const PAYCHECK_CATEGORY_TYPE_LABELS: Record<PaycheckCategoryType, string> = {
+  regular: "Regular",
+  spending_budget: "Spending Budget",
+  goal: "Goal",
 };
 
 export type PaycheckCategory = {
@@ -67,8 +77,9 @@ export type PaycheckCategory = {
   name: string;
   /** Percent of paycheck (0-100) allocated to this category. */
   percent: number;
-  /** When true, this category's dollar amount also appears on the Budget page. */
-  isSpendingBudget: boolean;
+  categoryType: PaycheckCategoryType;
+  /** Required when categoryType is "goal"; the goal this category funds. */
+  linkedGoalId?: string;
 };
 
 export type PaycheckConfig = {
